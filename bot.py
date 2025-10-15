@@ -1,7 +1,6 @@
 import os, time
 import pandas as pd, numpy as np
 from ta.trend import EMAIndicator
-from ta.momentum import RSIIndicator
 from oandapyV20 import API
 from oandapyV20.endpoints import instruments
 from dotenv import load_dotenv
@@ -25,13 +24,8 @@ def get_candles(count=200):
 def check_signals(df):
     df["ema4"] = EMAIndicator(df["close"],4).ema_indicator()
     df["ema50"] = EMAIndicator(df["close"],50).ema_indicator()
-    rsi = RSIIndicator(df["close"],14).rsi()
-    rsi4 = EMAIndicator(rsi,4).ema_indicator()
-    rsi50 = EMAIndicator(rsi,50).ema_indicator()
-    buy = (df["ema4"].iloc[-2] < df["ema50"].iloc[-2]) and (df["ema4"].iloc[-1] > df["ema50"].iloc[-1]) \
-          and (rsi4.iloc[-2] < rsi50.iloc[-2]) and (rsi4.iloc[-1] > rsi50.iloc[-1])
-    sell = (df["ema4"].iloc[-2] > df["ema50"].iloc[-2]) and (df["ema4"].iloc[-1] < df["ema50"].iloc[-1]) \
-           and (rsi4.iloc[-2] > rsi50.iloc[-2]) and (rsi4.iloc[-1] < rsi50.iloc[-1])
+    buy = (df["ema4"].iloc[-2] < df["ema50"].iloc[-2]) and (df["ema4"].iloc[-1] > df["ema50"].iloc[-1])
+    sell = (df["ema4"].iloc[-2] > df["ema50"].iloc[-2]) and (df["ema4"].iloc[-1] < df["ema50"].iloc[-1])
     return buy, sell
 
 def paper_trade(side):
