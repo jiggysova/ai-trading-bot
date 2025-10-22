@@ -48,4 +48,4 @@ while True:
         paper_trade("SELL")
     else:
         print(f"[{time.strftime('%H:%M:%S')}] Waiting...")
-    time.sleep(60 * 15)
+    time.sleep(60)  # check every minute
