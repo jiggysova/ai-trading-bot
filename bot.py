@@ -9,7 +9,7 @@ from oandapyV20.endpoints.instruments import InstrumentsCandles
 
 
 # =========================================================
-# ENVIRONMENT AND OANDA CONNECTION
+# ENVIRONMENT
 # =========================================================
 
 load_dotenv()
@@ -18,8 +18,13 @@ OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 
 if not OANDA_API_KEY:
     raise RuntimeError(
-        "OANDA_API_KEY is missing from your environment."
+        "OANDA_API_KEY is missing from your .env file."
     )
+
+
+# =========================================================
+# OANDA CONNECTION
+# =========================================================
 
 client = API(
     access_token=OANDA_API_KEY,
@@ -41,6 +46,10 @@ CANDLE_COUNT = 300
 SWING_STRENGTH = 3
 CHECK_INTERVAL_SECONDS = 60
 
+# Safety switch.
+# The bot cannot place orders while this remains False.
+ORDERS_ENABLED = False
+
 
 # =========================================================
 # ACTIVE SETUP MEMORY
@@ -49,11 +58,14 @@ CHECK_INTERVAL_SECONDS = 60
 active_setup = {
     "active": False,
     "direction": None,
-    "level": None,
+    "swept_level": None,
     "sweep_price": None,
     "sweep_time": None,
+    "structure_break_found": False,
+    "break_level": None,
+    "break_price": None,
+    "break_time": None,
 }
-
 
 # =========================================================
 # DATA FUNCTIONS
@@ -64,7 +76,7 @@ def fetch_candles(
     count: int = CANDLE_COUNT,
 ) -> pd.DataFrame:
     """
-    Download completed candles from OANDA.
+    Download completed midpoint candles from OANDA.
     """
 
     params = {
@@ -82,7 +94,7 @@ def fetch_candles(
 
     candles = []
 
-    for candle in response["candles"]:
+    for candle in response.get("candles", []):
         if not candle.get("complete", False):
             continue
 
@@ -108,8 +120,63 @@ def fetch_candles(
             f"for {INSTRUMENT}."
         )
 
+    dataframe = dataframe.sort_values(
+        "time"
+    ).reset_index(drop=True)
+
     return dataframe
 
+
+def validate_market_data(
+    dataframe: pd.DataFrame,
+    timeframe: str,
+) -> None:
+    """
+    Confirm that candle data contains everything the bot needs.
+    """
+
+    required_columns = {
+        "time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    }
+
+    missing_columns = (
+        required_columns
+        - set(dataframe.columns)
+    )
+
+    if missing_columns:
+        raise RuntimeError(
+            f"{timeframe} data is missing columns: "
+            f"{sorted(missing_columns)}"
+        )
+
+    minimum_candles = (
+        SWING_STRENGTH * 2
+    ) + 10
+
+    if len(dataframe) < minimum_candles:
+        raise RuntimeError(
+            f"Not enough {timeframe} candles. "
+            f"Received {len(dataframe)}, "
+            f"need at least {minimum_candles}."
+        )
+
+    price_columns = [
+        "open",
+        "high",
+        "low",
+        "close",
+    ]
+
+    if dataframe[price_columns].isnull().any().any():
+        raise RuntimeError(
+            f"{timeframe} candle data contains missing prices."
+        )
 
 # =========================================================
 # SWING DETECTION
@@ -120,10 +187,7 @@ def identify_swings(
     strength: int = SWING_STRENGTH,
 ) -> pd.DataFrame:
     """
-    Mark swing highs and swing lows.
-
-    A swing high must be higher than the candles around it.
-    A swing low must be lower than the candles around it.
+    Mark confirmed swing highs and swing lows.
     """
 
     df = dataframe.copy()
@@ -220,7 +284,7 @@ def latest_swing_levels(
 
 
 # =========================================================
-# H4 TREND DETECTION
+# H4 TREND
 # =========================================================
 
 def determine_trend(
@@ -271,27 +335,22 @@ def determine_trend(
         swing_lows.iloc[-1]["low"]
     )
 
-    bullish_structure = (
+    if (
         latest_high > previous_high
         and latest_low > previous_low
-    )
-
-    bearish_structure = (
-        latest_high < previous_high
-        and latest_low < previous_low
-    )
-
-    if bullish_structure:
+    ):
         return "BULLISH"
 
-    if bearish_structure:
+    if (
+        latest_high < previous_high
+        and latest_low < previous_low
+    ):
         return "BEARISH"
 
     return "RANGING"
 
-
 # =========================================================
-# LIQUIDITY SWEEP DETECTION
+# H1 LIQUIDITY SWEEP
 # =========================================================
 
 def detect_liquidity_sweep(
@@ -301,12 +360,12 @@ def detect_liquidity_sweep(
     Detect an H1 liquidity sweep.
 
     Bullish sweep:
-    Price trades below a previous swing low,
-    then closes back above that level.
+    Price trades below the latest swing low
+    and closes back above it.
 
     Bearish sweep:
-    Price trades above a previous swing high,
-    then closes back below that level.
+    Price trades above the latest swing high
+    and closes back below it.
     """
 
     df = identify_swings(dataframe)
@@ -391,8 +450,8 @@ def save_sweep_to_memory(
     """
     Save a valid H1 sweep.
 
-    Bullish sweeps are accepted only when H4 is bullish.
-    Bearish sweeps are accepted only when H4 is bearish.
+    Bullish sweep requires bullish H4 structure.
+    Bearish sweep requires bearish H4 structure.
     """
 
     if active_setup["active"]:
@@ -408,33 +467,38 @@ def save_sweep_to_memory(
         and sweep["type"] == "BEARISH"
     )
 
-    if (
-        not valid_bullish_setup
-        and not valid_bearish_setup
+    if not (
+        valid_bullish_setup
+        or valid_bearish_setup
     ):
         return
 
     active_setup["active"] = True
     active_setup["direction"] = sweep["type"]
-    active_setup["level"] = sweep["level"]
+    active_setup["swept_level"] = sweep["level"]
     active_setup["sweep_price"] = sweep["sweep_price"]
     active_setup["sweep_time"] = sweep["candle_time"]
 
-    print("\n[SETUP SAVED]")
+    active_setup["structure_break_found"] = False
+    active_setup["break_level"] = None
+    active_setup["break_price"] = None
+    active_setup["break_time"] = None
+
+    print("\n[H1 SWEEP SAVED]")
     print(
-        f"Direction:    "
+        f"Direction:   "
         f"{active_setup['direction']}"
     )
     print(
-        f"Swept level:  "
-        f"{active_setup['level']:.3f}"
+        f"Swept level: "
+        f"{active_setup['swept_level']:.3f}"
     )
     print(
-        f"Sweep price:  "
+        f"Sweep price: "
         f"{active_setup['sweep_price']:.3f}"
     )
     print(
-        f"Sweep time:   "
+        f"Sweep time:  "
         f"{active_setup['sweep_time']}"
     )
 
@@ -443,7 +507,7 @@ def clear_active_setup(
     reason: str,
 ) -> None:
     """
-    Clear the stored setup.
+    Erase the current setup.
     """
 
     print(
@@ -452,9 +516,152 @@ def clear_active_setup(
 
     active_setup["active"] = False
     active_setup["direction"] = None
-    active_setup["level"] = None
+    active_setup["swept_level"] = None
     active_setup["sweep_price"] = None
     active_setup["sweep_time"] = None
+    active_setup["structure_break_found"] = False
+    active_setup["break_level"] = None
+    active_setup["break_price"] = None
+    active_setup["break_time"] = None
+
+    # =========================================================
+# M5 MARKET STRUCTURE BREAK
+# =========================================================
+
+def detect_m5_structure_break(
+    dataframe: pd.DataFrame,
+) -> dict:
+    """
+    Detect an M5 close through a confirmed swing.
+
+    Bullish setup:
+    M5 closes above the latest confirmed swing high.
+
+    Bearish setup:
+    M5 closes below the latest confirmed swing low.
+    """
+
+    no_break = {
+        "found": False,
+        "direction": None,
+        "break_level": None,
+        "break_price": None,
+        "break_time": None,
+    }
+
+    if not active_setup["active"]:
+        return no_break
+
+    if active_setup["structure_break_found"]:
+        return {
+            "found": True,
+            "direction": active_setup["direction"],
+            "break_level": active_setup["break_level"],
+            "break_price": active_setup["break_price"],
+            "break_time": active_setup["break_time"],
+        }
+
+    df = identify_swings(dataframe)
+
+    latest_candle = df.iloc[-1]
+    previous_data = df.iloc[:-1]
+
+    latest_close = float(
+        latest_candle["close"]
+    )
+
+    latest_time = latest_candle["time"]
+    sweep_time = active_setup["sweep_time"]
+
+    if latest_time <= sweep_time:
+        return no_break
+
+    if active_setup["direction"] == "BULLISH":
+        previous_swing_highs = previous_data[
+            previous_data["swing_high"]
+        ]
+
+        if previous_swing_highs.empty:
+            return no_break
+
+        break_level = float(
+            previous_swing_highs.iloc[-1]["high"]
+        )
+
+        if latest_close > break_level:
+            return {
+                "found": True,
+                "direction": "BULLISH",
+                "break_level": break_level,
+                "break_price": latest_close,
+                "break_time": latest_time,
+            }
+
+    if active_setup["direction"] == "BEARISH":
+        previous_swing_lows = previous_data[
+            previous_data["swing_low"]
+        ]
+
+        if previous_swing_lows.empty:
+            return no_break
+
+        break_level = float(
+            previous_swing_lows.iloc[-1]["low"]
+        )
+
+        if latest_close < break_level:
+            return {
+                "found": True,
+                "direction": "BEARISH",
+                "break_level": break_level,
+                "break_price": latest_close,
+                "break_time": latest_time,
+            }
+
+    return no_break
+
+
+def save_structure_break_to_memory(
+    structure_break: dict,
+) -> None:
+    """
+    Save the M5 structure break only once.
+    """
+
+    if not structure_break["found"]:
+        return
+
+    if active_setup["structure_break_found"]:
+        return
+
+    active_setup["structure_break_found"] = True
+    active_setup["break_level"] = (
+        structure_break["break_level"]
+    )
+    active_setup["break_price"] = (
+        structure_break["break_price"]
+    )
+    active_setup["break_time"] = (
+        structure_break["break_time"]
+    )
+
+    print("\n[M5 STRUCTURE BREAK FOUND]")
+    print(
+        f"Direction:   "
+        f"{structure_break['direction']}"
+    )
+    print(
+        f"Break level: "
+        f"{structure_break['break_level']:.3f}"
+    )
+    print(
+        f"Close price: "
+        f"{structure_break['break_price']:.3f}"
+    )
+    print(
+        f"Break time:  "
+        f"{structure_break['break_time']}"
+    )
 
 
 # =========================================================
@@ -466,20 +673,17 @@ def determine_bot_state(
     sweep: dict,
 ) -> str:
     """
-    Determine what the bot should wait for next.
+    Return the bot's current workflow state.
     """
 
     if active_setup["active"]:
-        if (
-            active_setup["direction"]
-            == "BULLISH"
-        ):
+        if active_setup["structure_break_found"]:
+            return "WAITING_FOR_M5_RETEST"
+
+        if active_setup["direction"] == "BULLISH":
             return "WAITING_FOR_M5_BULLISH_BREAK"
 
-        if (
-            active_setup["direction"]
-            == "BEARISH"
-        ):
+        if active_setup["direction"] == "BEARISH":
             return "WAITING_FOR_M5_BEARISH_BREAK"
 
     if sweep["type"] == "NONE":
@@ -493,6 +697,22 @@ def determine_bot_state(
 
     return "SWEEP_OPPOSES_H4_TREND"
 
+# =========================================================
+# DISPLAY HELPERS
+# =========================================================
+
+def format_price(
+    price: float | None,
+) -> str:
+    """
+    Format prices cleanly for terminal output.
+    """
+
+    if price is None:
+        return "NONE"
+
+    return f"{price:.3f}"
+
 
 # =========================================================
 # STATUS DISPLAY
@@ -500,7 +720,8 @@ def determine_bot_state(
 
 def display_status() -> None:
     """
-    Fetch all timeframes and display the bot status.
+    Fetch all required data, run the strategy,
+    and print the current bot status.
     """
 
     h4 = fetch_candles(
@@ -513,6 +734,21 @@ def display_status() -> None:
 
     m5 = fetch_candles(
         ENTRY_TIMEFRAME
+    )
+
+    validate_market_data(
+        h4,
+        TREND_TIMEFRAME,
+    )
+
+    validate_market_data(
+        h1,
+        LIQUIDITY_TIMEFRAME,
+    )
+
+    validate_market_data(
+        m5,
+        ENTRY_TIMEFRAME,
     )
 
     trend = determine_trend(h4)
@@ -532,6 +768,14 @@ def display_status() -> None:
         sweep,
     )
 
+    structure_break = (
+        detect_m5_structure_break(m5)
+    )
+
+    save_structure_break_to_memory(
+        structure_break
+    )
+
     bot_state = determine_bot_state(
         trend,
         sweep,
@@ -541,7 +785,7 @@ def display_status() -> None:
         m5.iloc[-1]["close"]
     )
 
-    latest_candle_time = (
+    latest_m5_time = (
         m5.iloc[-1]["time"]
     )
 
@@ -553,7 +797,7 @@ def display_status() -> None:
 
     print(
         "\n"
-        + "=" * 62
+        + "=" * 66
     )
 
     print(
@@ -561,128 +805,217 @@ def display_status() -> None:
     )
 
     print(
-        "Structure and liquidity detection mode"
+        "H4 Trend | H1 Liquidity | M5 Structure"
     )
 
     print(
-        "=" * 62
+        "=" * 66
     )
 
     print(
-        f"System time:          "
+        f"System time:             "
         f"{current_time}"
     )
 
     print(
-        f"Last completed M5:    "
-        f"{latest_candle_time}"
+        f"Last completed M5:       "
+        f"{latest_m5_time}"
     )
 
     print(
-        f"Instrument:           "
+        f"Instrument:              "
         f"{INSTRUMENT}"
     )
 
     print(
-        f"Current price:        "
+        f"Current price:           "
         f"{latest_price:.3f}"
     )
 
     print(
-        f"4H trend:             "
+        f"H4 candles loaded:       "
+        f"{len(h4)}"
+    )
+
+    print(
+        f"H1 candles loaded:       "
+        f"{len(h1)}"
+    )
+
+    print(
+        f"M5 candles loaded:       "
+        f"{len(m5)}"
+    )
+
+    print(
+        f"H4 trend:                "
         f"{trend}"
     )
 
     print(
-        f"Latest H1 swing high: "
-        f"{h1_swing_high}"
+        "-" * 66
     )
 
     print(
-        f"Latest H1 swing low:  "
-        f"{h1_swing_low}"
+        f"Latest H1 swing high:    "
+        f"{format_price(h1_swing_high)}"
     )
 
     print(
-        f"Latest M5 swing high: "
-        f"{m5_swing_high}"
+        f"Latest H1 swing low:     "
+        f"{format_price(h1_swing_low)}"
     )
 
     print(
-        f"Latest M5 swing low:  "
-        f"{m5_swing_low}"
+        f"Latest M5 swing high:    "
+        f"{format_price(m5_swing_high)}"
     )
 
     print(
-        "-" * 62
+        f"Latest M5 swing low:     "
+        f"{format_price(m5_swing_low)}"
     )
 
     print(
-        f"H1 liquidity sweep:   "
+        "-" * 66
+    )
+
+    print(
+        f"Current H1 sweep:        "
         f"{sweep['type']}"
     )
 
     if sweep["type"] != "NONE":
         print(
-            f"Swept level:          "
-            f"{sweep['level']:.3f}"
+            f"Current swept level:     "
+            f"{format_price(sweep['level'])}"
         )
 
         print(
-            f"Extreme price:        "
-            f"{sweep['sweep_price']:.3f}"
+            f"Current sweep price:     "
+            f"{format_price(sweep['sweep_price'])}"
         )
 
         print(
-            f"Sweep candle:         "
+            f"Current sweep time:      "
             f"{sweep['candle_time']}"
         )
 
     print(
-        "-" * 62
+        "-" * 66
     )
 
     if active_setup["active"]:
         print(
-            "Active setup:         YES"
+            "Active setup:            YES"
         )
 
         print(
-            f"Setup direction:      "
+            f"Setup direction:         "
             f"{active_setup['direction']}"
         )
 
         print(
-            f"Stored swept level:   "
-            f"{active_setup['level']:.3f}"
+            f"Stored swept level:      "
+            f"{format_price(active_setup['swept_level'])}"
         )
 
         print(
-            f"Stored sweep price:   "
-            f"{active_setup['sweep_price']:.3f}"
+            f"Stored sweep price:      "
+            f"{format_price(active_setup['sweep_price'])}"
         )
 
         print(
-            f"Stored sweep time:    "
+            f"Stored sweep time:       "
             f"{active_setup['sweep_time']}"
         )
 
+        print(
+            f"M5 structure break:      "
+            f"{'YES' if active_setup['structure_break_found'] else 'NO'}"
+        )
+
+        if active_setup["structure_break_found"]:
+            print(
+                f"Stored break level:      "
+                f"{format_price(active_setup['break_level'])}"
+            )
+
+            print(
+                f"Stored break price:      "
+                f"{format_price(active_setup['break_price'])}"
+            )
+
+            print(
+                f"Stored break time:       "
+                f"{active_setup['break_time']}"
+            )
+
     else:
         print(
-            "Active setup:         NO"
+            "Active setup:            NO"
+        )
+
+        print(
+            "M5 structure break:      NO"
         )
 
     print(
-        f"Bot state:            "
+        "-" * 66
+    )
+
+    print(
+        f"Bot state:               "
         f"{bot_state}"
     )
 
     print(
-        "Orders enabled:       NO"
+        f"Orders enabled:          "
+        f"{'YES' if ORDERS_ENABLED else 'NO'}"
     )
 
     print(
-        "=" * 62
+        "=" * 66
+    )
+
+
+# =========================================================
+# STARTUP TEST
+# =========================================================
+
+def run_startup_test() -> None:
+    """
+    Test the OANDA connection and all required timeframes.
+    """
+
+    print(
+        "[STARTUP TEST] Checking OANDA connection..."
+    )
+
+    timeframes = [
+        TREND_TIMEFRAME,
+        LIQUIDITY_TIMEFRAME,
+        ENTRY_TIMEFRAME,
+    ]
+
+    for timeframe in timeframes:
+        dataframe = fetch_candles(
+            timeframe,
+            count=50,
+        )
+
+        validate_market_data(
+            dataframe,
+            timeframe,
+        )
+
+        print(
+            f"[PASS] {timeframe}: "
+            f"{len(dataframe)} completed candles loaded."
+        )
+
+    print(
+        "[STARTUP TEST PASSED]"
     )
 
 
@@ -695,13 +1028,19 @@ def main() -> None:
     Run the bot continuously.
 
     The bot checks for a newly completed M5 candle.
-    It displays a fresh status only when a new M5 candle appears.
+    Full analysis runs only when a new M5 candle appears.
     """
 
+    run_startup_test()
+
     print(
-        "[BOT STARTED] "
-        "XAU/USD | H4/H1/M5 | "
-        "Liquidity detection mode"
+        "\n[BOT STARTED] "
+        "XAU/USD | H4/H1/M5 | Detection mode"
+    )
+
+    print(
+        "[SAFETY] Practice account only. "
+        "Order execution is disabled."
     )
 
     last_processed_candle = None
@@ -710,17 +1049,14 @@ def main() -> None:
         try:
             recent_m5 = fetch_candles(
                 ENTRY_TIMEFRAME,
-                count=10,
+                count=20,
             )
 
             newest_candle = (
                 recent_m5.iloc[-1]["time"]
             )
 
-            if (
-                newest_candle
-                != last_processed_candle
-            ):
+            if newest_candle != last_processed_candle:
                 display_status()
 
                 last_processed_candle = (
@@ -733,8 +1069,7 @@ def main() -> None:
 
         except KeyboardInterrupt:
             print(
-                "\n[BOT STOPPED] "
-                "Manual shutdown."
+                "\n[BOT STOPPED] Manual shutdown."
             )
             break
 
