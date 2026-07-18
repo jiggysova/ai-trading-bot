@@ -1,6 +1,4 @@
 pandas
-numpy
-ta
-oandapyV20
 python-dotenv
+oandapyV20
 requests
